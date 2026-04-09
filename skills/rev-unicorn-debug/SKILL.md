@@ -129,41 +129,25 @@ mu.hook_add(UC_HOOK_CODE, hook_code)
 def sim_malloc(mu):
     global heap_ptr
     size = mu.reg_read(UC_ARM64_REG_X0)
-    aligned = (size + 0xF) & ~0xF
     result = heap_ptr
-    heap_ptr += aligned
+    heap_ptr += (size + 0xF) & ~0xF
     mu.reg_write(UC_ARM64_REG_X0, result)
-    print(f"malloc({size:#x}) => {result:#x}")
 
 def sim_free(mu):
-    ptr = mu.reg_read(UC_ARM64_REG_X0)
-    print(f"free({ptr:#x}) — nop")
+    pass  # nop
 
 def sim_memcpy(mu):
-    dst = mu.reg_read(UC_ARM64_REG_X0)
-    src = mu.reg_read(UC_ARM64_REG_X1)
-    n = mu.reg_read(UC_ARM64_REG_X2)
-    data = mu.mem_read(src, n)
-    mu.mem_write(dst, bytes(data))
-    print(f"memcpy({dst:#x}, {src:#x}, {n:#x})")
+    dst, src, n = mu.reg_read(UC_ARM64_REG_X0), mu.reg_read(UC_ARM64_REG_X1), mu.reg_read(UC_ARM64_REG_X2)
+    mu.mem_write(dst, bytes(mu.mem_read(src, n)))
 
 def sim_strlen(mu):
     s = mu.reg_read(UC_ARM64_REG_X0)
     data = mu.mem_read(s, 0x1000)
-    length = data.index(0) if 0 in data else len(data)
-    mu.reg_write(UC_ARM64_REG_X0, length)
+    mu.reg_write(UC_ARM64_REG_X0, data.index(0) if 0 in data else len(data))
 
 def sim_memset(mu):
-    dst = mu.reg_read(UC_ARM64_REG_X0)
-    val = mu.reg_read(UC_ARM64_REG_X1) & 0xFF
-    n = mu.reg_read(UC_ARM64_REG_X2)
+    dst, val, n = mu.reg_read(UC_ARM64_REG_X0), mu.reg_read(UC_ARM64_REG_X1) & 0xFF, mu.reg_read(UC_ARM64_REG_X2)
     mu.mem_write(dst, bytes([val] * n))
-
-def sim_printf(mu):
-    fmt_ptr = mu.reg_read(UC_ARM64_REG_X0)
-    fmt = mu.mem_read(fmt_ptr, 0x100)
-    fmt_str = bytes(fmt).split(b'\x00')[0].decode('utf-8', errors='replace')
-    print(f"printf(\"{fmt_str}\", ...)")
 
 # Register hooks
 import_hooks[MALLOC_ADDR] = sim_malloc
@@ -213,16 +197,13 @@ for offset, (name, handler) in jni_hooks.items():
 
 def sim_jni_get_string_utf_chars(mu):
     jstring = mu.reg_read(UC_ARM64_REG_X2)
-    # Read the fake string we stored
     data = mu.mem_read(jstring, 0x100)
-    s = bytes(data).split(b'\x00')[0].decode()
-    # Allocate and write the UTF string
+    s = bytes(data).split(b'\x00')[0]
     global heap_ptr
     buf = heap_ptr
     heap_ptr += (len(s) + 0x10) & ~0xF
-    mu.mem_write(buf, s.encode() + b'\x00')
+    mu.mem_write(buf, s + b'\x00')
     mu.reg_write(UC_ARM64_REG_X0, buf)
-    print(f"GetStringUTFChars => \"{s}\" at {buf:#x}")
 ```
 
 ### Simulating Syscalls (Linux ARM64)
@@ -232,26 +213,18 @@ def hook_intr(mu, intno, user_data):
     if intno == 2:  # ARM64 SVC
         syscall_num = mu.reg_read(UC_ARM64_REG_X8)
         if syscall_num == 64:    # write
-            fd = mu.reg_read(UC_ARM64_REG_X0)
             buf = mu.reg_read(UC_ARM64_REG_X1)
             count = mu.reg_read(UC_ARM64_REG_X2)
-            data = mu.mem_read(buf, count)
-            print(f"syscall write({fd}, {bytes(data)}, {count})")
             mu.reg_write(UC_ARM64_REG_X0, count)
         elif syscall_num == 222:  # mmap
-            addr = mu.reg_read(UC_ARM64_REG_X0)
-            length = mu.reg_read(UC_ARM64_REG_X1)
-            length = (length + 0xFFF) & ~0xFFF
-            if addr == 0:
-                global heap_ptr
-                addr = heap_ptr
-                heap_ptr += length
+            length = (mu.reg_read(UC_ARM64_REG_X1) + 0xFFF) & ~0xFFF
+            global heap_ptr
+            addr = heap_ptr
+            heap_ptr += length
             mu.mem_map(addr, length, UC_PROT_ALL)
             mu.reg_write(UC_ARM64_REG_X0, addr)
-            print(f"syscall mmap => {addr:#x}")
         else:
-            print(f"unhandled syscall {syscall_num}")
-            mu.reg_write(UC_ARM64_REG_X0, 0)
+            mu.reg_write(UC_ARM64_REG_X0, 0)  # stub: return 0
 
 mu.hook_add(UC_HOOK_INTR, hook_intr)
 ```
@@ -260,23 +233,26 @@ mu.hook_add(UC_HOOK_INTR, hook_intr)
 
 ## Step 4: Debugging Callbacks
 
-### Trace Execution (Instruction Level)
+**Log verbosity principle:** Keep trace output minimal by default. Only enable instruction-level tracing on small, targeted address ranges. Prefer block-level tracing and summary logging over per-instruction dumps. When the emulated function is long or loops heavily, use counters and print summaries instead of logging every step.
+
+### Trace Execution (Instruction Level — use sparingly)
+
+Only trace a narrow range you're investigating, never the entire execution:
 
 ```python
 def hook_code_trace(mu, address, size, user_data):
-    # Read instruction bytes
     code = mu.mem_read(address, size)
     print(f"  {address:#010x}: {bytes(code).hex()}")
 
-# Trace a specific range only (avoid flooding output)
+# Trace ONLY the specific range under investigation
 mu.hook_add(UC_HOOK_CODE, hook_code_trace, begin=FUNC_START, end=FUNC_END)
 ```
 
-### Trace Basic Blocks
+### Trace Basic Blocks (preferred over instruction trace)
 
 ```python
 def hook_block(mu, address, size, user_data):
-    print(f">>> Basic block at {address:#x}, size={size}")
+    print(f">>> Block {address:#x} (size={size})")
 
 mu.hook_add(UC_HOOK_BLOCK, hook_block)
 ```
@@ -285,19 +261,9 @@ mu.hook_add(UC_HOOK_BLOCK, hook_block)
 
 ```python
 def hook_mem_invalid(mu, access, address, size, value, user_data):
-    access_type = {
-        UC_MEM_READ_UNMAPPED: "READ",
-        UC_MEM_WRITE_UNMAPPED: "WRITE",
-        UC_MEM_FETCH_UNMAPPED: "FETCH",
-    }.get(access, f"UNKNOWN({access})")
-
-    print(f"!!! Unmapped {access_type} at {address:#x}, size={size}")
-
-    # Auto-map the missing page
     page = address & ~0xFFF
     try:
         mu.mem_map(page, 0x1000, UC_PROT_ALL)
-        print(f"    => Auto-mapped page {page:#x}")
         return True  # continue emulation
     except:
         return False  # stop
@@ -305,18 +271,15 @@ def hook_mem_invalid(mu, access, address, size, value, user_data):
 mu.hook_add(UC_HOOK_MEM_UNMAPPED, hook_mem_invalid)
 ```
 
-### Trace Memory Access
+### Trace Memory Access (targeted range only)
 
 ```python
 def hook_mem_access(mu, access, address, size, value, user_data):
-    if access == UC_MEM_WRITE:
-        print(f"  MEM WRITE: [{address:#x}] = {value:#x} (size={size})")
-    elif access == UC_MEM_READ:
-        data = mu.mem_read(address, size)
-        val = int.from_bytes(bytes(data), 'little')
-        print(f"  MEM READ:  [{address:#x}] => {val:#x} (size={size})")
+    op = "W" if access == UC_MEM_WRITE else "R"
+    val = value if access == UC_MEM_WRITE else int.from_bytes(bytes(mu.mem_read(address, size)), 'little')
+    print(f"  MEM {op}: [{address:#x}] = {val:#x}")
 
-# Trace memory access in a specific range
+# Only attach to the data range you care about
 mu.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, hook_mem_access,
             begin=DATA_START, end=DATA_END)
 ```
@@ -336,26 +299,21 @@ mu.mem_map(INPUT_BUF, 0x10000, UC_PROT_ALL)
 mu.mem_write(INPUT_BUF, input_data)
 mu.reg_write(UC_ARM64_REG_X0, INPUT_BUF)
 
-# Set LR to a known "end" address to detect return
+# Set LR to a sentinel address to catch return
 END_ADDR = 0xDEAD0000
 mu.mem_map(END_ADDR & ~0xFFF, 0x1000, UC_PROT_ALL)
 mu.reg_write(UC_ARM64_REG_LR, END_ADDR)
 
-# Run emulation
-FUNC_ADDR = BASE + 0x1234  # offset of target function
+# Run
+FUNC_ADDR = BASE + 0x1234
 try:
     mu.emu_start(FUNC_ADDR, END_ADDR, timeout=10 * UC_SECOND_SCALE)
 except UcError as e:
-    pc = mu.reg_read(UC_ARM64_REG_PC)
-    print(f"Emulation error at {pc:#x}: {e}")
+    print(f"Error at {mu.reg_read(UC_ARM64_REG_PC):#x}: {e}")
 
 # Read result
 result = mu.reg_read(UC_ARM64_REG_X0)
-print(f"Return value: {result:#x}")
-
-# Read output buffer if applicable
 output = bytes(mu.mem_read(OUTPUT_BUF, OUTPUT_SIZE))
-print(f"Output: {output.hex()}")
 ```
 
 ---
@@ -375,13 +333,10 @@ When emulation fails, follow this loop:
 5. **Re-run** — repeat until the target function completes
 
 ```python
-# Example: detect infinite loop by counting executions
 exec_count = {}
-
 def hook_loop_detect(mu, address, size, user_data):
     exec_count[address] = exec_count.get(address, 0) + 1
     if exec_count[address] > 10000:
-        print(f"!!! Possible infinite loop at {address:#x}")
         mu.emu_stop()
 
 mu.hook_add(UC_HOOK_CODE, hook_loop_detect)
